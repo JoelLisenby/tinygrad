@@ -77,9 +77,9 @@ def hand_coded_optimizations(k:Scheduler) -> Scheduler:
       vecs = [_peel_cast(s) for s in mulop.src] if mulop.op is Ops.MUL else []
       vecs = [s for s in vecs if s.op is Ops.INDEX]
       idx = vecs[0].src[1].get_idx() if len(vecs) == 1 else None
-      # vector is reduce-only (may be r*stride+r); INDEX with a GLOBAL is fused GEMM
-      matvec = idx is not None and first_reduce_rng in idx.ranges and \
-        not any(r in idx.ranges for r in k.ranges_of(AxisType.GLOBAL))
+      # one large GLOBAL is GEMV (decode batch/seq may be size 1). two is GEMM.
+      large_g = sum(1 for i in k.axes_of(AxisType.GLOBAL) if resolve(k.full_shape[i] > 1, False))
+      matvec = idx is not None and first_reduce_rng in idx.ranges and large_g == 1
       if matvec: threads = next((t for t in (8, 16, 32) if first_reduce_rng.src[0].divides(t) is not None), 0)
     else: matvec = False
     if matvec and threads and first_reduce_rng.src[0].divides(threads) is not None:
