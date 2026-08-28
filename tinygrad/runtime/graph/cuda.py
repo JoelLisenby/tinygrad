@@ -8,6 +8,13 @@ from tinygrad.runtime.ops_cuda import CUDADevice, check, encode_args, cu_time_ex
 from tinygrad.engine.jit import MultiGraphRunner
 
 class CUDAGraph(MultiGraphRunner):
+  @staticmethod
+  def supports_uop(batch_devs, new_call: UOp) -> bool:
+    # IQ4 graphs, but in the 27B jit that merges 117 layers into huge batches; SetParams is slower than launching it
+    if new_call.src[0].op is Ops.PROGRAM and "iq4" in (getattr(new_call.src[0].arg, "name", "") or ""):
+      return False
+    return MultiGraphRunner.supports_uop(batch_devs, new_call)
+
   def __init__(self, linear, input_uops=()):
     super().__init__(linear, input_uops)
 
