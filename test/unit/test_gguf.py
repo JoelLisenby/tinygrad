@@ -337,6 +337,46 @@ class TestGGUFGEMV(unittest.TestCase):
   @unittest.skipUnless(dtypes.bfloat16 in supported_dtypes, "Backend must support bfloat16")
   def test_gguf_gemv_bf16(self): self._test_gguf_gemv(GGMLQuantizationType.BF16)
 
+@unittest.skipUnless(Device.DEFAULT.split(":")[0] in ("CUDA", "NV"), "CUDA quant Linear")
+class TestCUDAQuantLinear(unittest.TestCase):
+  def _test_linear(self, qtype: GGMLQuantizationType, rows=256, cols=256):
+    from tinygrad.llm.kernels.nvidia import Linear
+    block_size, type_size = GGML_QUANT_SIZES[qtype]
+    n_blocks = rows * cols // block_size
+    rng = np.random.default_rng(42)
+    q_data = rng.integers(0, 256, size=n_blocks * type_size, dtype=np.uint8).reshape(n_blocks, type_size)
+    scales = np.float16(rng.standard_normal(n_blocks * 4)).view(np.uint8).reshape(n_blocks, -1)
+    if qtype in (GGMLQuantizationType.Q4_K, GGMLQuantizationType.Q5_K): q_data[:, :4] = scales[:, :4]
+    elif qtype == GGMLQuantizationType.Q6_K: q_data[:, -2:] = scales[:, :2]
+    elif qtype == GGMLQuantizationType.IQ4_XS: q_data[:, :2] = scales[:, :2]
+    q_data = q_data.flatten()
+    buf = bytearray()
+    buf += struct.pack("<4siqq", b"GGUF", 3, 1, 0)
+    buf += struct.pack("<Q", 6) + b"weight"
+    buf += struct.pack("<I", 2)
+    buf += struct.pack("<QQ", cols, rows)
+    buf += struct.pack("<i", qtype.value)
+    buf += struct.pack("<Q", 0)
+    buf += b"\x00" * ((32 - len(buf) % 32) % 32)
+    buf += q_data.tobytes()
+    _, tensors = gguf_load(Tensor(np.frombuffer(buf, dtype=np.uint8).copy()).to(None))
+    x = rng.standard_normal(cols).astype(np.float32)
+    lin = Linear(cols, rows, bias=False)
+    lin.weight = tensors["weight"]
+    y = lin(Tensor(x)).numpy()
+    self.assertEqual(lin.ggml_type, qtype.value)
+    # kernel quantizes activations to Q8 groups; compare in that space
+    Wfp = dequantize(q_data, qtype).reshape(rows, cols)
+    xg = x.reshape(-1, 32)
+    gscale = np.maximum(np.max(np.abs(xg), axis=-1, keepdims=True) / 127, 1e-8)
+    x_q8 = (np.clip(np.round(xg / gscale), -127, 127) * gscale).reshape(cols)
+    np.testing.assert_allclose(y, Wfp @ x_q8, atol=1e-2, rtol=1e-2)
+
+  def test_cuda_linear_q4_k(self): self._test_linear(GGMLQuantizationType.Q4_K)
+  def test_cuda_linear_q5_k(self): self._test_linear(GGMLQuantizationType.Q5_K)
+  def test_cuda_linear_q6_k(self): self._test_linear(GGMLQuantizationType.Q6_K)
+  def test_cuda_linear_iq4_xs(self): self._test_linear(GGMLQuantizationType.IQ4_XS)
+
 class TestGGUFGC(unittest.TestCase):
   def test_gguf_load_no_tensor_leak(self):
     """gguf_load must not retain references to the input tensor after returning."""

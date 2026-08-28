@@ -2,7 +2,8 @@ from __future__ import annotations
 import enum, functools, itertools, pathlib
 from dataclasses import dataclass, replace
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, function, dtypes
-from tinygrad.llm.kernels.amd import Linear, gated_delta_prefill, flash_attention, amd_custom_kernels_supported
+from tinygrad.llm.kernels.amd import gated_delta_prefill, flash_attention, amd_custom_kernels_supported
+from tinygrad.llm.kernels.nvidia import Linear
 from tinygrad.llm.gguf import gguf_load
 from tinygrad.uop.ops import resolve
 
