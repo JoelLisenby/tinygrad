@@ -8,13 +8,6 @@ from tinygrad.runtime.ops_cuda import CUDADevice, check, encode_args, cu_time_ex
 from tinygrad.engine.jit import MultiGraphRunner
 
 class CUDAGraph(MultiGraphRunner):
-  @staticmethod
-  def supports_uop(batch_devs, new_call: UOp) -> bool:
-    # IQ4 decode uses ops NVRTC emits that cuGraphAddKernelNode rejects (CUDA_ERROR_INVALID_VALUE)
-    if new_call.src[0].op is Ops.PROGRAM and "iq4" in (getattr(new_call.src[0].arg, "name", "") or ""):
-      return False
-    return MultiGraphRunner.supports_uop(batch_devs, new_call)
-
   def __init__(self, linear, input_uops=()):
     super().__init__(linear, input_uops)
 

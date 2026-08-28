@@ -1,5 +1,5 @@
 import os, struct, unittest, tempfile, pathlib, sys
-from tinygrad import dtypes, Tensor, fetch, Device
+from tinygrad import dtypes, Tensor, fetch, Device, TinyJit
 from tinygrad.helpers import disable_gc
 from tinygrad.llm.gguf import _ggml_iq_grid, ggml_data_to_tensor, gguf_load
 from tinygrad.runtime.autogen import ggml_common as _ggml
@@ -339,7 +339,7 @@ class TestGGUFGEMV(unittest.TestCase):
 
 @unittest.skipUnless(Device.DEFAULT.split(":")[0] in ("CUDA", "NV"), "CUDA quant Linear")
 class TestCUDAQuantLinear(unittest.TestCase):
-  def _test_linear(self, qtype: GGMLQuantizationType, rows=256, cols=256):
+  def _test_linear(self, qtype: GGMLQuantizationType, rows=256, cols=256, jit=False):
     from tinygrad.llm.kernels.nvidia import Linear
     block_size, type_size = GGML_QUANT_SIZES[qtype]
     n_blocks = rows * cols // block_size
@@ -363,7 +363,13 @@ class TestCUDAQuantLinear(unittest.TestCase):
     x = rng.standard_normal(cols).astype(np.float32)
     lin = Linear(cols, rows, bias=False)
     lin.weight = tensors["weight"]
-    y = lin(Tensor(x)).numpy()
+    xt = Tensor(x)
+    if jit:
+      @TinyJit
+      def run(t): return lin(t).contiguous()
+      y = run(xt).numpy()
+      np.testing.assert_allclose(y, run(xt).numpy(), atol=1e-5, rtol=1e-5)
+    else: y = lin(xt).numpy()
     self.assertEqual(lin.ggml_type, qtype.value)
     # kernel quantizes activations to Q8 groups; compare in that space
     Wfp = dequantize(q_data, qtype).reshape(rows, cols)
@@ -376,6 +382,7 @@ class TestCUDAQuantLinear(unittest.TestCase):
   def test_cuda_linear_q5_k(self): self._test_linear(GGMLQuantizationType.Q5_K)
   def test_cuda_linear_q6_k(self): self._test_linear(GGMLQuantizationType.Q6_K)
   def test_cuda_linear_iq4_xs(self): self._test_linear(GGMLQuantizationType.IQ4_XS)
+  def test_cuda_linear_iq4_xs_jit(self): self._test_linear(GGMLQuantizationType.IQ4_XS, jit=True)
 
 class TestGGUFGC(unittest.TestCase):
   def test_gguf_load_no_tensor_leak(self):
