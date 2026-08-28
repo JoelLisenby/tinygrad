@@ -1,7 +1,7 @@
 from __future__ import annotations
 import functools, math
 from typing import Callable
-from tinygrad import Tensor, UOp
+from tinygrad import Tensor, UOp, Context
 from tinygrad.dtype import AddrSpace, dtypes
 from tinygrad.helpers import prod
 from tinygrad.uop.ops import AxisType, KernelInfo, Ops
@@ -30,22 +30,19 @@ def _load(ptr:UOp, lanes:int|None=None) -> UOp:
 def _dp4a(a:UOp, b:UOp, c:UOp) -> UOp:
   return UOp(Ops.CUSTOM, src=(a.cast(dtypes.int32), b.cast(dtypes.int32), c), arg=("__dp4a({0}, {1}, {2})", dtypes.int32))
 
-def _perm_index(sel:UOp) -> UOp:
-  # AMD perm selector is one nibble per byte; CUDA __byte_perm packs those nibbles into one word
-  sel = sel.cast(dtypes.uint32)
-  return (sel & 15) | (((sel >> 8) & 15) << 4) | (((sel >> 16) & 15) << 8) | (((sel >> 24) & 15) << 12)
+@functools.cache
+def iq4nl_lut(device:str) -> Tensor:
+  from tinygrad.runtime.autogen.ggml_common import kvalues_iq4nl
+  return Tensor(kvalues_iq4nl, dtype=dtypes.int8, device=device).contiguous()
 
-def _byte_perm(a:UOp, b:UOp, selectors:UOp) -> UOp:
-  # CUDA __byte_perm(a,b): a=bytes 0-3, b=bytes 4-7. AMD perm(src0,src1) is the other way on some docs;
-  # IQ4_XS only matches with (b, a).
-  src = tuple(x.cast(dtypes.uint32) for x in (b, a, _perm_index(selectors)))
-  return UOp(Ops.CUSTOMI, src=src, arg=("__byte_perm({}, {}, {})", dtypes.uint32))
-
-def _iq4_bytes(packed:UOp, shift:int) -> UOp:
-  selectors = (packed >> shift) & 0x0f0f0f0f
-  low = _byte_perm(UOp.const(0xf6eaddcf, dtypes.uint32), UOp.const(0xbfad9881, dtypes.uint32), selectors)
-  high = _byte_perm(UOp.const(0x71594535, dtypes.uint32), UOp.const(0x26190d01, dtypes.uint32), selectors & 0x07070707)
-  return _byte_perm(high, low, 0x03020100 | ((selectors & 0x08080808) >> 1))
+def _iq4_bytes(packed:UOp, shift:int, lut:UOp) -> UOp:
+  # nibble LUT instead of __byte_perm: CUDA graphs reject kernels that use that builtin
+  sel = (packed >> shift) & 0x0f0f0f0f
+  word = UOp.const(0, dtypes.uint32)
+  for i in range(4):
+    b = lut[((sel >> (8*i)) & 15).cast(dtypes.int32)].load().bitcast(dtypes.uint8).cast(dtypes.uint32)
+    word = word | (b << (8*i))
+  return word
 
 def _q5_scales(raw:UOp, base:UOp, subgroup:UOp) -> tuple[UOp, UOp, UOp, UOp]:
   w1, w2, w3 = _load(raw[base+1]), _load(raw[base+2]), _load(raw[base+3])
@@ -57,6 +54,9 @@ def _q5_scales(raw:UOp, base:UOp, subgroup:UOp) -> tuple[UOp, UOp, UOp, UOp]:
   return _half(d), _half(dmin), scale.float(), minimum.float()
 
 class Linear(AMDLinear):
+  def set_quantized(self, decoded:Tensor):
+    # Q6_K pads packed bytes with .realize(); @function sets ALLOW_DEVICE_USAGE=0
+    with Context(ALLOW_DEVICE_USAGE=1): super().set_quantized(decoded)
   def __call__(self, x:Tensor) -> Tensor:
     supported = self.use_custom_quant and cuda_custom_kernels_supported(self.weight.device)
     if self.ggml_type is None and supported:
@@ -116,7 +116,8 @@ def _decode_linear(out:UOp, out_features:int, group_count:int, group_dot, name:s
     arg=KernelInfo(name=name, opts_to_apply=()))
 
 @functools.cache
-def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, out_features:int, in_features:int, ggml_type:int) -> UOp:
+def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, *rest, out_features:int, in_features:int, ggml_type:int) -> UOp:
+  lut = rest[0] if rest else None
   group_count = in_features // Q8_GROUP_SIZE
   def group_dot(token:UOp, output:UOp, group:UOp) -> UOp:
     block, subgroup = group // 8, group % 8
@@ -138,7 +139,7 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, out_features:
       dot = UOp.const(0, dtypes.int32)
       for word_idx in range(8):
         packed = _load(raw[base + 2 + subgroup*4 + word_idx%4])
-        dot = _dp4a(_iq4_bytes(packed, 4*(word_idx//4)), xwords[word_idx], dot)
+        dot = _dp4a(_iq4_bytes(packed, 4*(word_idx//4), lut), xwords[word_idx], dot)
       d, scale = _iq4_scales(raw, base, subgroup)
       return dot.float() * xd[token, group] * d * scale
     base = (output*in_features//GGML_BLOCK_SIZE+block)*Q6_WORDS
@@ -155,7 +156,7 @@ def _quant_decode_kernel(out:UOp, raw:UOp, xq:UOp, xd:UOp, xs:UOp, out_features:
               .cast(dtypes.uint8).bitcast(dtypes.int8).float() for i in range(2)]
     gsum = [xs[token, group, i].load() * 32 for i in range(2)]
     return ((dots[0].float() - gsum[0])*scales[0] + (dots[1].float() - gsum[1])*scales[1]) * xd[token, group] * _half(raw[base+52] & 0xffff)
-  names = {Q4_K: "linear_q4_k", Q5_K: "linear_q5_k", IQ4_XS: "linear_iq4_xs", Q6_K: "linear_q6"}
+  names = {Q4_K: "linear_q4_k", Q5_K: "linear_q5_k", IQ4_XS: "linear_iq4_xs_lut", Q6_K: "linear_q6"}
   return _decode_linear(out, out_features, group_count, group_dot, names[ggml_type])
 
 def q8_linear(layer:Linear, x:Tensor) -> Tensor:
@@ -172,8 +173,9 @@ def q8_linear(layer:Linear, x:Tensor) -> Tensor:
     return result if layer.bias is None else result + layer.bias
   xq_, xd, xs = q8_quantize(x, tokens, in_features)
   decode = functools.partial(_quant_decode_kernel, ggml_type=layer.ggml_type)
+  extra = (iq4nl_lut(x.device).uop,) if layer.ggml_type == IQ4_XS else ()
   out = Tensor.empty(tokens, out_features, (in_features+1023)//1024, dtype=dtypes.float32, device=x.device).uop
-  return run(decode, out, raw, xq_.uop, xd.uop, xs.uop)
+  return run(decode, out, raw, xq_.uop, xd.uop, xs.uop, *extra)
 
 def _view_back(t:Tensor) -> Tensor:
   uop = t.uop
